@@ -5,27 +5,28 @@ import collections
 
 class DQN():
 
-    def __init__(self, input_shape, num_actions, optimizer, use_target_network=True, use_double_dqn=False, gamma=0.99):
+    def __init__(self, state_dim, num_actions, use_target_network=True, use_double_dqn=True, gamma=0.99, hidden_size=64,
+                 batch_size=128, max_length=32):
 
-        input_shape = (None,) + input_shape
-        output_shape = (None, num_actions)
-
-        self.memory = collections.deque(maxlen=1e6)
-
-        self.optimizer = optimizer
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.hidden_size = hidden_size
+        self.memory = ReplayBuffer()
         self.use_target_network = use_target_network
         self.use_double_dqn = use_double_dqn
         self.gamma = gamma
+        self.batch_size = batch_size
+        self.max_seq_length = max_length
 
         self.qvars = None
         self.tvars = None
 
-        self.input = tf.placeholder(tf.float32, shape=input_shape)
-        normalized_input = self.input / 127.5 - 1.0  # faster to do here on gpu instead on cpu during observation
+        self.input = tf.placeholder(tf.float32, shape=[None, self.max_seq_length, self.state_dim])
+        self.input_state_length = tf.placeholder(tf.int32, shape=[None, ])
 
         # q network graph definition
         with tf.variable_scope("qnet"):
-            self.output = self._network(normalized_input, num_actions)
+            self.output = self._network(self.input)
             current_scope = tf.get_default_graph().get_name_scope()
             self.qvars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=current_scope)
             self.qvars.sort(key=lambda x: x.name)
@@ -33,7 +34,7 @@ class DQN():
         if self.use_target_network or self.use_double_dqn:
             # target network graph definition
             with tf.variable_scope("tnet"):
-                self.target = self._network(normalized_input, num_actions)
+                self.target = self._network(self.input)
                 current_scope = tf.get_default_graph().get_name_scope()
                 self.tvars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=current_scope)
                 self.tvars.sort(key=lambda x: x.name)
@@ -42,102 +43,118 @@ class DQN():
             self.update_target_op = [var[0].assign(var[1]) for var in zip(self.tvars, self.qvars)]
 
         # training operations definition
-        self.yt_loss = tf.placeholder(tf.float32, shape=(None))
-        self.actions = tf.placeholder(tf.int32, shape=(None))
+        self.yt_loss = tf.placeholder(tf.float32, shape=[None, ])
+        self.actions = tf.placeholder(tf.int32, shape=[None, ])
         actions_onehot = tf.one_hot(self.actions, num_actions)
         q_actions = tf.multiply(actions_onehot, self.output)
 
         self.loss = tf.losses.huber_loss(self.yt_loss, tf.reduce_sum(q_actions, axis=1))
-        self.train_op = self.optimizer.minimize(loss=self.loss)
+        self.train_op = tf.train.AdamOptimizer.minimize(loss=self.loss)
+        self.sess = tf.Session()
+        self.sess.run(tf.global_variables_initializer())
 
-    def _network(self, input, num_actions):
-        conv1 = tf.layers.conv2d(inputs=input, filters=32, kernel_size=(8, 8), strides=(4, 4), activation=tf.nn.relu)
-        conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=(4, 4), strides=(2, 2), activation=tf.nn.relu)
-        conv3 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=(3, 3), strides=(1, 1), activation=tf.nn.relu)
-        flat = tf.contrib.layers.flatten(conv3)
-        fc1 = tf.layers.dense(inputs=flat, units=512, activation=tf.nn.relu)
-        output = tf.layers.dense(inputs=fc1, units=num_actions, activation=None)
+    def _network(self, input_state):
+        basic_cell = tf.contrib.GRUCell(num_units=self.hidden_size)
+        _, states = tf.nn.dynamic_rnn(basic_cell, input_state, dtype=tf.float32,
+                                      sequence_length=self.input_state_length)
+        net = tf.contrib.slim.fully_connected(states, self.hidden_size)
+        net = tf.contrib.slim.fully_connected(net, self.hidden_size)
+        output = tf.contrib.slim.fully_connected(net, self.num_actions, activation_fn=None)
         return output
 
     # update target network weights
-    def updateTargetNetwork(self, sess):
+    def updateTargetNetwork(self):
         if self.use_target_network or self.use_double_dqn:
-            sess.run(self.update_target_op)
+            self.sess.run(self.update_target_op)
 
-    def updateModel(self, sess, batch):
-        states, actions, rewards, new_states, endgames = batch
+    def updateModel(self):
+        states, state_length, actions, rewards, new_states, new_states_length, endgames = self.memory.sample(self.batch_size)
 
         qtarget = None
 
         if self.use_double_dqn:
             # computing target Q value using target network and double deep q-network algorithm
-            [n_out, t_out] = sess.run([self.output, self.target], feed_dict={self.input: np.array(new_states)})
+            [n_out, t_out] = self.sess.run([self.output, self.target],
+                                           feed_dict={self.input: new_states,
+                                                      self.input_state_length: new_states_length})
             target_action = np.argmax(n_out, axis=1)
             qtarget = np.array([output_sample[target_action[sample]] for sample, output_sample in enumerate(t_out)])
         elif self.use_target_network:
             # computing target Q value using target network
-            qtarget = np.amax(sess.run(self.target, feed_dict={self.input: np.array(new_states)}), axis=1)
+            qtarget = np.amax(self.sess.run(self.target, feed_dict={self.input: new_states,
+                                                                    self.input_state_length: new_states_length}), axis=1)
         else:
-            qtarget = np.amax(sess.run(self.output, feed_dict={self.input: np.array(new_states)}), axis=1)
+            qtarget = np.amax(self.sess.run(self.output, feed_dict={self.input: new_states,
+                                                                    self.input_state_length: new_states_length}), axis=1)
 
         yt = rewards + self.gamma * (np.logical_not(endgames) * qtarget)
 
         # computing loss and update weights of  Q network
-        sess.run([self.loss, self.train_op],
-                 feed_dict={self.input: np.array(states), self.yt_loss: yt, self.actions: np.array(actions)})
+        loss, _ = self.sess.run([self.loss, self.train_op],
+                                feed_dict={self.input: states, self.input_state_length: state_length, self.yt_loss: yt,
+                                           self.actions: np.array(actions)})
+        return loss
 
-    def predict(self, sess, X):
-        return sess.run(self.output, feed_dict={self.input: X})
+    def get_action(self, state, state_length):
+        state = np.reshape(state, [state_length, self.state_dim])
+        return self.sess.run(self.output, feed_dict={self.input: state, self.input_state_length:state_length})
 
-    def takeAction(self, sess, X):
-        return np.argmax(self.predict(sess, np.array([X]))[0])
-
-    def store(self, states, actions, rewards, next_states, done):
-        '''
-        store transitions to experience replay
-        :param states:
-        :param actions:
-        :param rewards:
-        :param next_states:
-        :param done:
-        :return:
-        '''
-        pass
-
-    def learn(self):
-        '''
-        Sample random batch of samples and update the network parameters.
-        :return:
-        '''
-        pass
-
+    def store(self, s1, s1_length, a, r, s2, s2_length, done):
+        s1 = np.array(s1).reshape([s1_length, self.state_dim])
+        s2 = np.array(s2).reshape([s2_length, self.state_dim])
+        if s1_length < self.max_seq_length:  # 补0
+            padding_mat = np.zeros([self.max_seq_length - s1_length, self.state_dim])
+            s1 = np.vstack((s1, padding_mat))
+        if s2_length < self.max_seq_length:
+            padding_mat = np.zeros([self.max_seq_length - s2_length, self.state_dim])
+            s2 = np.vstack((s2, padding_mat))
+        self.replay_buffer.add((s1, s1_length, a, r, s2, s2_length, done))
 
 
 class DuelingDQN(DQN):
 
     # just redefine the network architecture
-    def _network(self, input, num_actions):
-        conv1 = tf.layers.conv2d(inputs=input, filters=32, kernel_size=(8, 8), strides=(4, 4), activation=tf.nn.relu)
-        conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=(4, 4), strides=(2, 2), activation=tf.nn.relu)
-        conv3 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=(3, 3), strides=(1, 1), activation=tf.nn.relu)
-        conv3 = tf.contrib.layers.flatten(conv3)
-        # advantage stream
-        fc1a = tf.layers.dense(inputs=conv3, units=512, activation=tf.nn.relu)
-        fc1v = tf.layers.dense(inputs=conv3, units=512, activation=tf.nn.relu)
-        # value stream
-        advantage = tf.layers.dense(inputs=fc1a, units=num_actions, activation=tf.nn.relu)
-        value = tf.layers.dense(inputs=fc1v, units=1, activation=tf.nn.relu)
-        # output = tf.reshape(value, [-1, 1]) + (advantage - tf.reduce_mean(advantage, axis=1, keep_dims=True))
-        # output = value + tf.subtract(advantage, tf.reduce_mean(advantage, axis=1, keep_dims=True))
+    def _network(self, input_state):
+        basic_cell = tf.contrib.GRUCell(num_units=self.hidden_size)
+        _, states = tf.nn.dynamic_rnn(basic_cell, input_state, dtype=tf.float32,
+                                      sequence_length=self.input_state_length)
+        net = tf.contrib.slim.fully_connected(states, self.hidden_size)
+        net = tf.contrib.slim.fully_connected(net, self.hidden_size)
+        fc_a = tf.contrib.slim.fully_connected(net, self.hidden_size)
+        fc_v = tf.contrib.slim.fully_connected(net, self.hidden_size)
+        advantage = tf.contrib.slim.fully_connected(fc_a, self.num_actions)
+        value = tf.contrib.slim.fully_connected(fc_v, 1, activation_fn=None)
         output = value + (advantage - tf.reduce_mean(advantage, axis=1, keep_dims=True))
         return output
 
 
-def get_network(type, **kargs):
-    net = None
-    if type == 'dqn' or type == 'doubledqn':
-        net = DQN(**kargs)
-    elif 'duelingdqn' in type:
-        net = DuelingDQN(**kargs)
+class ReplayBuffer(object):
+    def __init__(self, max_len=100000):
+        self.storage = collections.deque(maxlen=max_len)
 
-    return net
+    # Expects tuples of (state, next_state, action, reward, done)
+    def add(self, data):
+        self.storage.append(data)
+
+    def sample(self, batch_size=32):
+        ind = np.random.randint(0, len(self.storage), size=batch_size)
+        s1, s1_length, a, r, s2, s2_length, done = [], [], [], [], [], [], []
+
+        for i in ind:
+            d1, d2, d3, d4, d5, d6, d7 = self.storage[i]
+            s1.append(np.array(d1, copy=False))
+            s1_length.append(np.array(d2, copy=False))
+            a.append(np.array(d3, copy=False))
+            r.append(np.array(d4, copy=False))
+            s2.append(np.array(d5, copy=False))
+            s2_length.append(np.array(d6, copy=False))
+            done.append(np.array(d7, copy=False))
+
+        return np.array(s1), np.array(s1_length), np.array(a), np.array(r), np.array(s2), np.array(s2_length), np.array(
+            done)
+
+    def get_size(self):
+        return len(self.storage)
+
+    def clear(self):
+        self.storage.clear()
